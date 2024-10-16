@@ -2,8 +2,9 @@ import argparse
 import torch
 import torch.backends.cudnn as cudnn
 from torchvision import models
-from data_aug.contrastive_learning_dataset import ContrastiveLearningDataset
+from data_aug.contrastive_learning_dataset import ContrastiveLearningDatasetWithParams,  transformation_params_to_tensor_batch,  params_collate_fn
 from models.resnet_simclr import ResNetSimCLR
+from models.vits import KQConModel, ViT
 from simclr import SimCLR
 
 model_names = sorted(name for name in models.__dict__
@@ -20,11 +21,11 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     help='model architecture: ' +
                          ' | '.join(model_names) +
                          ' (default: resnet50)')
-parser.add_argument('-j', '--workers', default=12, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
                     help='number of data loading workers (default: 32)')
 parser.add_argument('--epochs', default=200, type=int, metavar='N',
                     help='number of total epochs to run')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=128, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -64,25 +65,43 @@ def main():
         args.device = torch.device('cpu')
         args.gpu_index = -1
 
-    dataset = ContrastiveLearningDataset(args.data)
+    dataset = ContrastiveLearningDatasetWithParams(args.data)
 
     train_dataset = dataset.get_dataset(args.dataset_name, args.n_views)
 
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True, drop_last=True)
+        torch.utils.data.Subset(train_dataset, range(256)), batch_size=args.batch_size, shuffle=True,
+        num_workers=args.workers, pin_memory=True, drop_last=True, collate_fn=params_collate_fn)
 
-    model = ResNetSimCLR(base_model=args.arch, out_dim=args.out_dim)
+    vit = ViT()
+    KQConModel(vit)
+    for images, params_list in train_loader:
+    # images is a list of tensors [img1, img2]
+    # params_list is a list of dicts [{params_img1}, {params_img2}]
+        print(len(images), images[0].shape, images[1].shape)
+        print(len(params_list[0]["color_jitter_applied"]))
+        x1 = images[0]
+        x2 = images[1]
 
-    optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=args.weight_decay)
+        t1 = params_list[0]
+        t2 = params_list[1]
+        #print(t1)
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader), eta_min=0,
-                                                           last_epoch=-1)
+        # Convert transformation parameters dict to tensor
+        t1_tensor = transformation_params_to_tensor_batch(t1)
+        t2_tensor = transformation_params_to_tensor_batch(t2)
+        print(t1_tensor.shape)
+    # model = ResNetSimCLR(base_model=args.arch, out_dim=args.out_dim)
 
-    #  It’s a no-op if the 'gpu_index' argument is a negative integer or None.
-    with torch.cuda.device(args.gpu_index):
-        simclr = SimCLR(model=model, optimizer=optimizer, scheduler=scheduler, args=args)
-        simclr.train(train_loader)
+    # optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=args.weight_decay)
+
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader), eta_min=0,
+    #                                                        last_epoch=-1)
+
+    # #  It’s a no-op if the 'gpu_index' argument is a negative integer or None.
+    # with torch.cuda.device(args.gpu_index):
+    #     simclr = SimCLR(model=model, optimizer=optimizer, scheduler=scheduler, args=args)
+    #     simclr.train(train_loader)
 
 
 if __name__ == "__main__":
