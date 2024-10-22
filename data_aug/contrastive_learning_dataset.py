@@ -70,7 +70,7 @@ class ContrastiveLearningDatasetWithParams:
                 self.root_folder,
                 train=True,
                 transform=ContrastiveLearningViewGeneratorWithParams(
-                    self.get_simclr_pipeline_transform(32),
+                    self.get_simclr_pipeline_transform(224),
                     n_views
                 ),
                 download=True
