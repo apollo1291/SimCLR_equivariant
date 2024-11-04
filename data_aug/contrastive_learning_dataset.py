@@ -9,7 +9,8 @@ from data_aug.custom_transforms import (
     GaussianBlurWithParams
 )
 from torchvision import transforms, datasets
-from data_aug.view_generator import ContrastiveLearningViewGenerator
+from torchvision.datasets import ImageFolder
+from data_aug.view_generator import ContrastiveLearningViewGeneratorWithParams
 from exceptions.exceptions import InvalidDatasetSelection
 from torchvision.transforms import functional as F
 import torch
@@ -42,21 +43,6 @@ class CustomTransformPipeline:
         #print(transformation_params)
         return img, transformation_params
 
-class ContrastiveLearningViewGeneratorWithParams:
-    """Generate multiple views of the same image with transformation parameters."""
-    def __init__(self, base_transform, n_views=2):
-        self.base_transform = base_transform
-        self.n_views = n_views
-
-    def __call__(self, x):
-        imgs = []
-        params_list = []
-        for _ in range(self.n_views):
-            img, params = self.base_transform(x)
-            imgs.append(img)
-            params_list.append(params)
-        return imgs, params_list
-
 class ContrastiveLearningDatasetWithParams:
     def __init__(self, root_folder):
         self.root_folder = root_folder
@@ -66,6 +52,14 @@ class ContrastiveLearningDatasetWithParams:
 
     def get_dataset(self, name, n_views):
         valid_datasets = {
+            'imagenet': lambda: ImageFolder(
+                self.root_folder,
+                transform=ContrastiveLearningViewGeneratorWithParams(
+                    self.get_simclr_pipeline_transform(224),  # ImageNet standard size
+                    n_views
+                )
+            ), 
+            
             'cifar10': lambda: datasets.CIFAR10(
                 self.root_folder,
                 train=True,

@@ -20,7 +20,7 @@ from info_nce import InfoNCE, info_nce
 from utils import InfoNCE, info_nce, save_config_file, accuracy, save_checkpoint
 from data_aug.contrastive_learning_dataset import transformation_params_to_tensor_batch
 
-NUM_CLASS = 10
+NUM_CLASS = 1000
 
 @dataclass
 class ForwardOutput:
@@ -105,7 +105,7 @@ class BaseKQConModel(nn.Module):
 
         return ForwardOutput(loss, image_rep1, predicted_rep2, image_rep2, predicted_rep1, logits, labels)
 
-    def train(self, train_loader, vol, use_fourier=False):
+    def train(self, train_loader, use_fourier=False):
 
         scaler = GradScaler(enabled=self.args.fp16_precision)
         # save config file
@@ -139,7 +139,6 @@ class BaseKQConModel(nn.Module):
                     self.writer.add_scalar('acc/top5', top5[0], global_step=n_iter)
                     self.writer.add_scalar('learning_rate', self.scheduler.get_lr()[0], global_step=n_iter)
 
-                    vol.commit()
 
                 n_iter += 1
 
@@ -159,7 +158,6 @@ class BaseKQConModel(nn.Module):
         }, is_best=False, filename=os.path.join(self.writer.log_dir, checkpoint_name))
         logging.info(f"Model checkpoint and metadata has been saved at {self.writer.log_dir}.")
         
-        vol.commit()
 
 class KQConModel(BaseKQConModel):
     def __init__(self, model, dim=256, mlp_dim=4096, args=None, optimizer=None, scheduler=None):
