@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 from dataclasses import dataclass
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -33,21 +34,27 @@ class ForwardOutput:
     labels: torch.Tensor
     
 class BaseKQConModel(nn.Module):
-    def __init__(self, model, dim=256, mlp_dim=4096, args=None, optimizer=None, scheduler=None) -> None:
+    def __init__(self, model, mlp_dim=4096, args=None, optimizer=None, scheduler=None, device='cpu') -> None:
         super().__init__()
-        self.model = model.to(args.device)
+        self.model = model #.to(args.device)
+        self.device = device
+        #print(model.device)
        #self.fourier_encoder_fn = fourier_encoder
+        self.num_bands = 6
+        self.num_transfrom_params = 12
+        self.encoding_size = self.num_bands * self.num_transfrom_params * 2
 
-        self._build_projector_and_predictor_mlps(dim, mlp_dim)
-
+        self._build_projector_and_predictor_mlps( mlp_dim)
+        
         self.loss_fn =  InfoNCE()
 
         self.args = args
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.writer = SummaryWriter(log_dir="/runs/simclr")
+        current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.writer = SummaryWriter(log_dir=f"/datadrive/ellington/logs/{current_time}")
         logging.basicConfig(filename=os.path.join(self.writer.log_dir, 'training.log'), level=logging.DEBUG)
-    
+        
     # From mocoV3
     def _build_mlp(self, num_layers, input_dim, mlp_dim, output_dim, last_bn=True):
         mlp = []
@@ -68,11 +75,13 @@ class BaseKQConModel(nn.Module):
     def _build_projector_and_predictor_mlps(self, dim, mlp_dim):
         pass
     
-    def fourier_encoder_fn(self, x, num_bands=6, max_freq=10.0):
+    def fourier_encoder_fn(self, x,  max_freq=10.0):
         """
         Apply Fourier feature mapping to input tensor x.
         """
         batch_size, num_params = x.shape
+        num_bands = self.num_bands
+        assert num_params == self.num_transfrom_params
         freq_bands = torch.linspace(1.0, max_freq, num_bands).to(x.device)
         x_expanded = x.unsqueeze(-1)  # Shape: (batch_size, num_params, 1)
         freq_bands = freq_bands.view(1, 1, -1)  # Shape: (1, 1, num_bands)
@@ -81,7 +90,7 @@ class BaseKQConModel(nn.Module):
         cos_x = torch.cos(x_freq)
         pe = torch.cat([sin_x, cos_x], dim=-1)  # Shape: (batch_size, num_params, num_bands * 2)
         pe = pe.view(batch_size, -1)  # Flatten to (batch_size, num_params * num_bands * 2)
-        return pe
+        return pe.to(self.device)
 
     def _forward(self, x1, x2, t1, t2, use_fourier=True):
         t_diff = t2 - t1
@@ -113,12 +122,13 @@ class BaseKQConModel(nn.Module):
 
         n_iter = 0
         logging.info(f"Start SimCLR training for {self.args.epochs} epochs.")
+        logging.info(f"Using fouirer_encoding: {use_fourier}.")
         logging.info(f"Training with gpu: {self.args.disable_cuda}.")
 
         for epoch_counter in range(self.args.epochs):
             for images, params in tqdm(train_loader):
-                x1, x2 = images[0].to(self.args.device), images[1].to(self.args.device)
-                t1, t2 = transformation_params_to_tensor_batch(params[0]).to(self.args.device), transformation_params_to_tensor_batch(params[1]).to(self.args.device)  # Assign transformation parameters if applicable
+                x1, x2 = images[0].to(self.device), images[1].to(self.device)
+                t1, t2 = transformation_params_to_tensor_batch(params[0]).to(self.device), transformation_params_to_tensor_batch(params[1]).to(self.device)  # Assign transformation parameters if applicable
 
                 with autocast(enabled=self.args.fp16_precision):
                     # Forward pass through the model
@@ -137,7 +147,7 @@ class BaseKQConModel(nn.Module):
                     self.writer.add_scalar('loss', loss, global_step=n_iter)
                     self.writer.add_scalar('acc/top1', top1[0], global_step=n_iter)
                     self.writer.add_scalar('acc/top5', top5[0], global_step=n_iter)
-                    self.writer.add_scalar('learning_rate', self.scheduler.get_lr()[0], global_step=n_iter)
+                    self.writer.add_scalar('learning_rate', self.scheduler.get_last_lr()[0], global_step=n_iter)
 
 
                 n_iter += 1
@@ -160,12 +170,18 @@ class BaseKQConModel(nn.Module):
         
 
 class KQConModel(BaseKQConModel):
-    def __init__(self, model, dim=256, mlp_dim=4096, args=None, optimizer=None, scheduler=None):
-        super().__init__(model=model, dim=dim, mlp_dim=mlp_dim, args=args, optimizer=optimizer, scheduler=scheduler)
+    def __init__(self, model,  mlp_dim=4096, args=None, optimizer=None, scheduler=None):
+        self.device = model.device
+        model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        super().__init__(model=model, mlp_dim=mlp_dim, args=args, optimizer=optimizer, scheduler=scheduler, device=self.device)
     
-    def _build_projector_and_predictor_mlps(self, dim, mlp_dim, num_layers=3, output_dim=100):
-        self.predictor = self._build_mlp(num_layers, dim, mlp_dim, output_dim=self.model.vit.embed_dim, last_bn=True)
-        self.linear_classifier = self._build_mlp(num_layers, self.model.rep_size, mlp_dim, output_dim=NUM_CLASS, last_bn=False)
+    def get_feature_encoding_size(self):
+        return self.encoding_size
+
+    def _build_projector_and_predictor_mlps(self, mlp_dim, num_layers=3, output_dim=100):
+        input_dim = self.get_feature_encoding_size()
+        self.projector = self._build_mlp(num_layers,input_dim=input_dim, mlp_dim=mlp_dim, output_dim=self.model.vit.embed_dim, last_bn=True).to(self.device)
+        self.linear_classifier = self._build_mlp(num_layers, self.model.rep_size, mlp_dim, output_dim=NUM_CLASS, last_bn=False).to(self.device)
     
     def forward(self, x1, x2, t1, t2, use_fourier):
         output = self._forward(x1, x2, t1, t2, use_fourier)

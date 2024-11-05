@@ -55,7 +55,7 @@ class ContrastiveLearningDatasetWithParams:
             'imagenet': lambda: ImageFolder(
                 self.root_folder,
                 transform=ContrastiveLearningViewGeneratorWithParams(
-                    self.get_simclr_pipeline_transform(224),  # ImageNet standard size
+                    self.get_simclr_pipeline_transform(224),
                     n_views
                 )
             ), 
