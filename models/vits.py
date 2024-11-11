@@ -9,17 +9,14 @@ from datetime import datetime
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
-from torch.utils.tensorboard import SummaryWriter
+import pytorch_lightning as pl
 
 import timm
-from timm.models.vision_transformer import VisionTransformer, _cfg
-from torchvision import transforms
 
-from info_nce import InfoNCE, info_nce
-from utils import InfoNCE, info_nce, save_config_file, accuracy, save_checkpoint
+from utils import InfoNCE, accuracy
 from data_aug.contrastive_learning_dataset import transformation_params_to_tensor_batch
+
+import pytorch_lightning as pl
 
 NUM_CLASS = 1000
 
@@ -33,27 +30,31 @@ class ForwardOutput:
     logits: torch.Tensor
     labels: torch.Tensor
     
-class BaseKQConModel(nn.Module):
-    def __init__(self, model, mlp_dim=4096, args=None, optimizer=None, scheduler=None, device='cpu') -> None:
-        super().__init__()
-        self.model = model #.to(args.device)
-        self.device = device
+class BaseKQConModel(pl.LightningModule):
+    def __init__(self, model, mlp_dim=1024, args=None,) -> None:
+        #.to(args.device)
+        #self.device = device
         #print(model.device)
        #self.fourier_encoder_fn = fourier_encoder
+        super().__init__()
+
         self.num_bands = 6
         self.num_transfrom_params = 12
         self.encoding_size = self.num_bands * self.num_transfrom_params * 2
 
-        self._build_projector_and_predictor_mlps( mlp_dim)
+        self.model = model
+
+        self._build_projector_and_predictor_mlps(model.vit.embed_dim, mlp_dim)
+
+
         
         self.loss_fn =  InfoNCE()
+        self.linear_classifier_loss = nn.CrossEntropyLoss()
 
         self.args = args
-        self.optimizer = optimizer
-        self.scheduler = scheduler
-        current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.writer = SummaryWriter(log_dir=f"/datadrive/ellington/logs/{current_time}")
-        logging.basicConfig(filename=os.path.join(self.writer.log_dir, 'training.log'), level=logging.DEBUG)
+
+        self.save_hyperparameters(ignore=['model'])
+        self.automatic_optimization = False
         
     # From mocoV3
     def _build_mlp(self, num_layers, input_dim, mlp_dim, output_dim, last_bn=True):
@@ -90,14 +91,19 @@ class BaseKQConModel(nn.Module):
         cos_x = torch.cos(x_freq)
         pe = torch.cat([sin_x, cos_x], dim=-1)  # Shape: (batch_size, num_params, num_bands * 2)
         pe = pe.view(batch_size, -1)  # Flatten to (batch_size, num_params * num_bands * 2)
-        return pe.to(self.device)
+        return pe
 
     def _forward(self, x1, x2, t1, t2, use_fourier=True):
-        t_diff = t2 - t1
+
+        device = x1.device
+        t_diff = (t2 - t1).to(device)
 
         CLSq1, CLSq2 = None, None
         if use_fourier:
             fea1, fea2 = self.fourier_encoder_fn(t_diff), self.fourier_encoder_fn(-t_diff)
+
+            #print(fea1.device)
+            #print(self.projector.device)
             CLSq1, CLSq2 = self.projector(fea1), self.projector(fea2)
 
         image_rep1, predicted_rep2 = self.model(x1, CLSq1)
@@ -114,74 +120,104 @@ class BaseKQConModel(nn.Module):
 
         return ForwardOutput(loss, image_rep1, predicted_rep2, image_rep2, predicted_rep1, logits, labels)
 
-    def train(self, train_loader, use_fourier=False):
+    def training_step(self, batch, batch_idx):
+        
+        optimizer_embedding, optimizer_classifier = self.optimizers()
+        
+        images, params, class_ids = batch
+        x1, x2 = images[0], images[1]
+        t1 = transformation_params_to_tensor_batch(params[0])
+        t2 = transformation_params_to_tensor_batch(params[1])
 
-        scaler = GradScaler(enabled=self.args.fp16_precision)
-        # save config file
-        save_config_file(self.writer.log_dir, self.args)
+        
+        forward_output = self.forward(x1, x2, t1, t2, use_fourier=self.args.use_fourier)
+        contrastive_loss, logits, labels = forward_output.loss, forward_output.logits, forward_output.labels
 
-        n_iter = 0
-        logging.info(f"Start SimCLR training for {self.args.epochs} epochs.")
-        logging.info(f"Using fouirer_encoding: {use_fourier}.")
-        logging.info(f"Training with gpu: {self.args.disable_cuda}.")
+        
+        if batch_idx % 10 == 0:
+            top1, top5 = accuracy(logits, labels, topk=(1, 5))
+            self.log('train_loss', contrastive_loss)
+            self.log('train_acc_top1', top1[0])
+            self.log('train_acc_top5', top5[0])
+            lr = optimizer_embedding.param_groups[0]['lr']
+            self.log('lr', lr, on_step=True, on_epoch=False)
 
-        for epoch_counter in range(self.args.epochs):
-            for images, params in tqdm(train_loader):
-                x1, x2 = images[0].to(self.device), images[1].to(self.device)
-                t1, t2 = transformation_params_to_tensor_batch(params[0]).to(self.device), transformation_params_to_tensor_batch(params[1]).to(self.device)  # Assign transformation parameters if applicable
+        optimizer_embedding.zero_grad()
+        self.manual_backward(contrastive_loss)
+        optimizer_embedding.step()
 
-                with autocast(enabled=self.args.fp16_precision):
-                    # Forward pass through the model
-                    output = self.forward(x1, x2, t1, t2, use_fourier)
-                    loss, logits, labels = output.loss, output.logits, output.labels
+        # Detach embeddings and compute classification loss for the evaluation head
+        image_rep1, image_rep2 = forward_output.image_rep1.detach(), forward_output.image_rep2.detach()
+        eval_logits1, eval_logits2 = self.linear_classifier(image_rep1), self.linear_classifier(image_rep2)
+        #print(class_ids)
+        class_ids = torch.tensor(class_ids).to(eval_logits1.device)
+        classification_loss = self.linear_classifier_loss(eval_logits1, class_ids) + self.linear_classifier_loss(eval_logits2, class_ids)
 
-                    self.optimizer.zero_grad()
+        
+        self.log('linear_class_train_loss', classification_loss, prog_bar=True)
 
-                    scaler.scale(loss).backward()
+        
+        optimizer_classifier.zero_grad()
+        self.manual_backward(classification_loss)
+        optimizer_classifier.step()
 
-                    scaler.step(self.optimizer)
-                    scaler.update()
-
-                if n_iter % self.args.log_every_n_steps == 0:
-                    top1, top5 = accuracy(logits, labels, topk=(1, 5))
-                    self.writer.add_scalar('loss', loss, global_step=n_iter)
-                    self.writer.add_scalar('acc/top1', top1[0], global_step=n_iter)
-                    self.writer.add_scalar('acc/top5', top5[0], global_step=n_iter)
-                    self.writer.add_scalar('learning_rate', self.scheduler.get_last_lr()[0], global_step=n_iter)
-
-
-                n_iter += 1
-
-            # warmup for the first 10 epochs
-            if epoch_counter >= 10:
-                self.scheduler.step()
-            logging.debug(f"Epoch: {epoch_counter}\tLoss: {loss}\tTop1 accuracy: {top1[0]}")
-
-        logging.info("Training has finished.")
-        # save model checkpoints
-        checkpoint_name = 'checkpoint_{:04d}.pth.tar'.format(self.args.epochs)
-        save_checkpoint({
-            'epoch': self.args.epochs,
-            'arch': self.args.arch,
-            'state_dict': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-        }, is_best=False, filename=os.path.join(self.writer.log_dir, checkpoint_name))
-        logging.info(f"Model checkpoint and metadata has been saved at {self.writer.log_dir}.")
+        
+        return contrastive_loss
+    
+    def validation_step(self, batch, batch_idx):
+        images, params, class_ids = batch
+        x1, x2 = images[0], images[1]
         
 
+        # Generate representations using frozen embedding model
+        with torch.no_grad():
+            t1 = transformation_params_to_tensor_batch(params[0])
+            t2 = transformation_params_to_tensor_batch(params[1])
+            forward_output = self.forward(x1, x2, t1, t2, use_fourier=self.args.use_fourier)
+            image_rep1, image_rep2 = forward_output.image_rep1, forward_output.image_rep2
+
+        
+            eval_logits1, eval_logits2 = self.linear_classifier(image_rep1), self.linear_classifier(image_rep2)
+            #print(class_ids)
+            class_ids = torch.tensor(class_ids).to(eval_logits1.device)
+            classification_loss = self.linear_classifier_loss(eval_logits1, class_ids) + self.linear_classifier_loss(eval_logits2, class_ids)
+        
+        
+        self.log('val_loss', classification_loss, prog_bar=True, on_epoch=True, batch_size=len(class_ids), sync_dist=True)
+
+        
+        top1_1, top5_1 = accuracy(eval_logits1, class_ids, topk=(1, 5))
+        top1_2, top5_2 = accuracy(eval_logits2, class_ids, topk=(1, 5))
+
+       
+        self.log('val_acc_top1', (top1_1[0] + top1_2[0]) / 2, prog_bar=True, on_epoch=True, batch_size=len(class_ids), sync_dist=True)
+        self.log('val_acc_top5', (top5_1[0] + top5_2[0]) / 2, prog_bar=True, on_epoch=True, batch_size=len(class_ids), sync_dist=True)
+
+        return classification_loss
+
+
+    
+    def configure_optimizers(self):
+        embedding_optimizer = torch.optim.Adam(self.parameters(), self.args.lr, weight_decay=self.args.weight_decay)
+
+        self.linear_classifier_optimizer = torch.optim.Adam(
+        self.linear_classifier.parameters(), lr=self.args.lr*10, weight_decay=self.args.weight_decay
+    )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(embedding_optimizer, T_max=self.args.epochs, eta_min=0)
+        return [embedding_optimizer, self.linear_classifier_optimizer], [{'scheduler': scheduler, 'interval': 'epoch', 'frequency': 1}]
+
 class KQConModel(BaseKQConModel):
-    def __init__(self, model,  mlp_dim=4096, args=None, optimizer=None, scheduler=None):
-        self.device = model.device
-        model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        super().__init__(model=model, mlp_dim=mlp_dim, args=args, optimizer=optimizer, scheduler=scheduler, device=self.device)
+    def __init__(self, model,  mlp_dim=1024, args=None,):
+        #self.device = model.device
+        super().__init__(model=model, mlp_dim=mlp_dim, args=args,)
     
     def get_feature_encoding_size(self):
         return self.encoding_size
 
-    def _build_projector_and_predictor_mlps(self, mlp_dim, num_layers=3, output_dim=100):
+    def _build_projector_and_predictor_mlps(self, embed_dim, mlp_dim, num_layers=10, output_dim=1000):
         input_dim = self.get_feature_encoding_size()
-        self.projector = self._build_mlp(num_layers,input_dim=input_dim, mlp_dim=mlp_dim, output_dim=self.model.vit.embed_dim, last_bn=True).to(self.device)
-        self.linear_classifier = self._build_mlp(num_layers, self.model.rep_size, mlp_dim, output_dim=NUM_CLASS, last_bn=False).to(self.device)
+        self.projector = self._build_mlp(num_layers,input_dim=input_dim, mlp_dim=mlp_dim, output_dim=embed_dim, last_bn=True)#.to(self.device)
+        self.linear_classifier = self._build_mlp(num_layers, self.model.rep_size, mlp_dim, output_dim=NUM_CLASS, last_bn=False)#.to(self.device)
     
     def forward(self, x1, x2, t1, t2, use_fourier):
         output = self._forward(x1, x2, t1, t2, use_fourier)

@@ -91,11 +91,14 @@ class ContrastiveLearningDatasetWithParams:
 def params_collate_fn(batch):
     images_list = []
     params_list = []
+    class_ids = []  # List to store class IDs
+
     for item in batch:
-        imgs_params, _ = item
+        imgs_params, class_id = item  # Retain the class ID
         imgs, params = imgs_params
         images_list.append(imgs)    # imgs is a list of images
         params_list.append(params)  # params is a list of dictionaries
+        class_ids.append(class_id)  # Collect class IDs
 
     # Transpose images_list and params_list to group by views
     images = list(zip(*images_list))   # Now images is a list of views, each containing batch_size images
@@ -107,15 +110,13 @@ def params_collate_fn(batch):
     # For params, collate the dictionaries
     params_collated = []
     for view_params in params:
-        # view_params is a tuple of dictionaries for the current view
-        # We can collate them into a dictionary of lists
         collated_params = {}
         keys = view_params[0].keys()
         for key in keys:
             collated_params[key] = [d[key] for d in view_params]
         params_collated.append(collated_params)
 
-    return images, params_collated
+    return images, params_collated, class_ids
 
 def transformation_params_to_tensor_batch(params_dict):
     """
