@@ -96,15 +96,15 @@ class BaseKQConModel(pl.LightningModule):
     def _forward(self, x1, x2, t1, t2, use_fourier=True):
 
         device = x1.device
-        t_diff = (t2 - t1).to(device)
+        t1, t2 = t1.to(device), t2.to(device)
 
         CLSq1, CLSq2 = None, None
         if use_fourier:
-            fea1, fea2 = self.fourier_encoder_fn(t_diff), self.fourier_encoder_fn(-t_diff)
+            fea1 = self.fourier_encoder_fn(t1)
 
             #print(fea1.device)
             #print(self.projector.device)
-            CLSq1, CLSq2 = self.projector(fea1), self.projector(fea2)
+            CLSq1 = self.projector(fea1)
 
         image_rep1, predicted_rep2 = self.model(x1, CLSq1)
         image_rep2, predicted_rep1 = self.model(x2, CLSq2)
