@@ -153,3 +153,16 @@ def transpose(x):
 
 def normalize(*xs):
     return [None if x is None else F.normalize(x, dim=-1) for x in xs]
+
+def contrast_loss(sims):
+    b = sims.shape[0]
+    sims = sims - torch.eye(b, b, device=sims.device) #* self.loss_margin
+    sims_1 = sims
+    sims_2 = sims.permute(1, 0)
+
+    label_mask = torch.eye(sims_1.shape[0], sims_1.shape[1], device=sims.device, dtype=sims.dtype)
+
+    labels = torch.arange(0, sims.shape[0], device=sims.device)
+    
+    nce_loss = 1 / 2 * (-F.log_softmax(sims_1, dim=-1) * label_mask).sum(1).mean() + 1 / 2 * (-F.log_softmax(sims_2, dim=-1) * label_mask).sum(1).mean()
+    return nce_loss, sims_1, labels

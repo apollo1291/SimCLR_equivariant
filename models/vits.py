@@ -13,7 +13,7 @@ import pytorch_lightning as pl
 
 import timm
 
-from utils import InfoNCE, accuracy
+from utils import InfoNCE, accuracy, contrast_loss
 from data_aug.contrastive_learning_dataset import transformation_params_to_tensor_batch
 
 import pytorch_lightning as pl
@@ -31,7 +31,7 @@ class ForwardOutput:
     labels: torch.Tensor
     
 class BaseKQConModel(pl.LightningModule):
-    def __init__(self, model, mlp_dim=1024, args=None,) -> None:
+    def __init__(self, model, mlp_dim=1024, args=None) -> None:
         #.to(args.device)
         #self.device = device
         #print(model.device)
@@ -48,7 +48,7 @@ class BaseKQConModel(pl.LightningModule):
 
 
         
-        self.loss_fn =  InfoNCE()
+        self.loss_fn = contrast_loss # InfoNCE()
         self.linear_classifier_loss = nn.CrossEntropyLoss()
 
         self.args = args
@@ -109,14 +109,21 @@ class BaseKQConModel(pl.LightningModule):
         image_rep1, predicted_rep2 = self.model(x1, CLSq1)
         image_rep2, predicted_rep1 = self.model(x2, CLSq2)
 
+        """
+        Curently, only img_loss2 is valid because, predicted_rep1 is not well defined
+        as a result of the asymetrical fourier encoding parameters, CLSq2 is always None
+        """
         if use_fourier:
-            img1_loss, img1_logits, img1_labels = self.loss_fn(image_rep1, predicted_rep1)
-            img2_loss, img2_logits, img2_labels = self.loss_fn(image_rep2, predicted_rep2)
-            loss = img1_loss + img2_loss
-            logits = torch.cat([img1_logits, img2_logits], dim=0)
-            labels = torch.cat([img1_labels, img2_labels], dim=0)
+            #img1_loss, img1_logits, img1_labels = self.loss_fn(image_rep1, predicted_rep1)
+            sims = torch.einsum("bc,dc->bd", image_rep2, predicted_rep2)
+            img2_loss, img2_logits, img2_labels = self.loss_fn(sims)
+            
+            loss =  img2_loss # + img1_loss
+            logits = img2_logits
+            labels = img2_labels
         else:
-            loss, logits, labels = self.loss_fn(image_rep1, image_rep2)
+            sims = torch.einsum("bc,dc->bd", image_rep1, image_rep2)
+            loss, logits, labels = self.loss_fn(sims)
 
         return ForwardOutput(loss, image_rep1, predicted_rep2, image_rep2, predicted_rep1, logits, labels)
 
@@ -134,14 +141,6 @@ class BaseKQConModel(pl.LightningModule):
         contrastive_loss, logits, labels = forward_output.loss, forward_output.logits, forward_output.labels
 
         
-        if batch_idx % 10 == 0:
-            top1, top5 = accuracy(logits, labels, topk=(1, 5))
-            self.log('train_loss', contrastive_loss)
-            self.log('train_acc_top1', top1[0])
-            self.log('train_acc_top5', top5[0])
-            lr = optimizer_embedding.param_groups[0]['lr']
-            self.log('lr', lr, on_step=True, on_epoch=False)
-
         optimizer_embedding.zero_grad()
         self.manual_backward(contrastive_loss)
         optimizer_embedding.step()
@@ -153,8 +152,21 @@ class BaseKQConModel(pl.LightningModule):
         class_ids = torch.tensor(class_ids).to(eval_logits1.device)
         classification_loss = self.linear_classifier_loss(eval_logits1, class_ids) + self.linear_classifier_loss(eval_logits2, class_ids)
 
-        
-        self.log('linear_class_train_loss', classification_loss, prog_bar=True)
+        if batch_idx % 10 == 0:
+            top1, top5 = accuracy(logits, labels, topk=(1, 5))
+            self.log('train_loss', contrastive_loss)
+            self.log('train_acc_top1', top1[0])
+            self.log('train_acc_top5', top5[0])
+            lr = optimizer_embedding.param_groups[0]['lr']
+            self.log('lr', lr, on_step=True, on_epoch=False)
+            top1_1, top5_1 = accuracy(eval_logits1, class_ids, topk=(1, 5))
+            top1_2, top5_2 = accuracy(eval_logits2, class_ids, topk=(1, 5))
+
+       
+            self.log('train_class_acc_top1', (top1_1[0] + top1_2[0]) / 2, prog_bar=True, on_epoch=True, batch_size=len(class_ids), sync_dist=True)
+            self.log('train_class_acc_top5', (top5_1[0] + top5_2[0]) / 2, prog_bar=True, on_epoch=True, batch_size=len(class_ids), sync_dist=True)
+
+            self.log('linear_class_train_loss', classification_loss, prog_bar=True)
 
         
         optimizer_classifier.zero_grad()
@@ -232,8 +244,18 @@ class ViT(nn.Module):
 
         self.rep_size = rep_size
 
+        
         self.vit = timm.create_model(model_name, pretrained=True)
         
+
+        # Create two learnable class tokens
+        self.cls_token1 = nn.Parameter(torch.zeros(1, 1, self.vit.embed_dim))
+        self.cls_token2 = nn.Parameter(torch.zeros(1, 1, self.vit.embed_dim))
+
+        
+        nn.init.normal_(self.cls_token1, std=0.02)
+        nn.init.normal_(self.cls_token2, std=0.02)
+
         # Disable the ViT's classifier head 
         self.vit.head = nn.Identity()
         
@@ -247,10 +269,16 @@ class ViT(nn.Module):
 
         img_embeddings = self.vit.patch_embed(img)
 
+        batch_size = img_embeddings.shape[0]
+
+        img_embeddings = torch.cat((img_embeddings, self.cls_token1.expand(batch_size, -1, -1)), dim=1)
+
         if fourier_encoding is not None:
             # Incorporate the Fourier encoding if provided
             fourier_encoding = fourier_encoding.unsqueeze(1)  # Shape: (batch_size, 1, embed_dim)
-            augmented_embeddings = torch.cat((img_embeddings, fourier_encoding), dim=1)
+
+            fec = self.cls_token2.expand(batch_size, -1, -1) + fourier_encoding
+            augmented_embeddings = torch.cat((img_embeddings, fec), dim=1)
         else:
             augmented_embeddings = img_embeddings
         # Add positional embeddings (if needed)
@@ -273,11 +301,11 @@ class ViT(nn.Module):
         x = self.vit.norm(x)
         
         # Extract the representations for the image and the additional input
-        image_representation = x[:, :-1, :]  # All but the last token are image patches
-        pair_representation = x[:, -1, :]   # The last token is the additional embedding
+        image_representation = x[:, -2, :]  # The second to last token is the class token with no FE, 
+        pair_representation = x[:, -1, :]   # The last token is includes FE information
         
         # Compute separate outputs for image and additional input
-        image_output = self.image_head(image_representation.mean(dim=1))  # Pool the image tokens
-        pair_output = self.additional_head(pair_representation)         # Single token for extra input
+        image_output = self.image_head(image_representation)  
+        pair_output = self.additional_head(pair_representation)
         
         return image_output, pair_output
