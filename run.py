@@ -5,9 +5,16 @@ from datetime import datetime
 from torchvision import models
 from data_aug.contrastive_learning_dataset import ContrastiveLearningDatasetWithParams, transformation_params_to_tensor_batch, params_collate_fn
 from models.resnet_simclr import ResNetSimCLR
-from models.vits import KQConModel, ViT
+from models.vits import KQConModel, ViT, ViTModel
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import TQDMProgressBar
+from tqdm import tqdm
+from simclr import SimCLR
+
+
+
+
+
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
@@ -51,6 +58,8 @@ parser.add_argument('--n-views', default=2, type=int, metavar='N',
                     help='Number of views for contrastive learning training.')
 parser.add_argument('--gpu-index', default=0, type=int, help='GPU index.')
 parser.add_argument('--use-fourier', action='store_true', help='Use Fourier encoding')
+parser.add_argument('--name', default="", help='An optional name to append to the log file name')
+parser.add_argument('--loss_leak', default=0.05, type=float, help="amount of leak in contrast loss")
 
 MODELS = {
     'resnet': ResNetSimCLR,
@@ -68,7 +77,8 @@ def main():
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True, drop_last=True, collate_fn=params_collate_fn)
+        num_workers=args.workers, 
+        pin_memory=True, drop_last=True, collate_fn=params_collate_fn)
 
     
     val_dataset = ContrastiveLearningDatasetWithParams(
@@ -80,12 +90,14 @@ def main():
         num_workers=args.workers, pin_memory=True, drop_last=True, collate_fn=params_collate_fn
     )
 
-    
+    _, params, _ = next(iter(train_loader))
+    params_size = len(list(params[0].keys()))
+
     model = MODELS[args.arch]()
-    lightning_model = KQConModel(model=model, args=args)
+    lightning_model = KQConModel(model=model, num_steps = len(train_loader), params_size=params_size, args=args)
 
     current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
-    logger = pl.loggers.TensorBoardLogger(save_dir=f"/datadrive/ellington/logs/{args.arch}_fe={args.use_fourier}_{current_time}")
+    logger = pl.loggers.TensorBoardLogger(save_dir=f"/datadrive/ellington/logs/{args.arch}_fe={args.use_fourier}_{current_time}_{args.name}")
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         save_top_k=1,
         monitor='train_loss',
@@ -95,12 +107,12 @@ def main():
 
     trainer = pl.Trainer(
         max_epochs=args.epochs,
-        devices=torch.cuda.device_count(),
+        devices=[0, 1, 2, 3],
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         strategy=pl.strategies.DDPStrategy(find_unused_parameters=True) if torch.cuda.device_count() > 1 else None,
         logger=logger,
         callbacks=[checkpoint_callback, TQDMProgressBar(refresh_rate=1)],
-        precision=16 if args.fp16_precision else 32,
+        precision=16, #if args.fp16_precision else 32,
         enable_progress_bar=True,
     )
 

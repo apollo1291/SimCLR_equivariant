@@ -6,10 +6,15 @@ from PIL import ImageFilter
 
 class RandomResizedCropWithParams(transforms.RandomResizedCrop):
     def __call__(self, img):
+        # Set a fixed seed for reproducibility
+        random.seed(0)  # Change the seed value as needed
         # Get parameters of the crop
         i, j, h, w = self.get_params(img, self.scale, self.ratio)
         # Record the parameters
-        params = {'crop': (i, j, h, w)}
+        params = {'crop_i': i, 
+                  'crop_j': j, 
+                  'crop_h': h, 
+                  'crop_w': w}
         # Apply the crop
         img = F.resized_crop(img, i, j, h, w, self.size, self.interpolation)
         return img, params

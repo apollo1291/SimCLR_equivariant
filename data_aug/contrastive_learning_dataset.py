@@ -16,21 +16,39 @@ from torchvision.transforms import functional as F
 import torch
 
 
-class ToTensorWithParams:
+class ToTensor:
     def __call__(self, img):
         img = F.to_tensor(img)
-        params = {}
-        return img, params
+        return img
+    
+class BaseTransformPipeline:
+    def __init__(self, size, s=1):
+        
+        self.normalize = [
+            transforms.Resize((size, size)),
+            ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),   
+        ]
+    def __call__(self, img):
+
+        for t in self.normalize:
+            img = t(img)
+        return img
 
 class CustomTransformPipeline:
     def __init__(self, size, s=1):
+        self.size = size
+        # Normalization for imagenet
         self.transforms = [
             RandomResizedCropWithParams(size=size),
             RandomHorizontalFlipWithParams(),
-            RandomApplyWithParams([ColorJitterWithParams(0.8 * s, 0.8 * s, 0.8 * s, 0.2 * s)], p=0.8),
+            #RandomApplyWithParams([ColorJitterWithParams(0.8 * s, 0.8 * s, 0.8 * s, 0.2 * s)], p=0.8),
             RandomGrayscaleWithParams(p=0.2),
             GaussianBlurWithParams(kernel_size=int(0.1 * size)),
-            ToTensorWithParams()
+        ]
+        self.normalize = [
+            ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),   
         ]
 
     def __call__(self, img):
@@ -40,6 +58,9 @@ class CustomTransformPipeline:
             params_list.append(params)
         # Combine all parameters into a single dictionary
         transformation_params = {k: v for d in params_list for k, v in d.items()}
+
+        for t in self.normalize:
+            img = t(img)
         #print(transformation_params)
         return img, transformation_params
 
@@ -49,12 +70,16 @@ class ContrastiveLearningDatasetWithParams:
 
     def get_simclr_pipeline_transform(self, size, s=1):
         return CustomTransformPipeline(size=size, s=s)
+    
+    def get_base_pipline_transform(self, size):
+        return BaseTransformPipeline(size) 
 
     def get_dataset(self, name, n_views):
         valid_datasets = {
             'imagenet': lambda: ImageFolder(
                 self.root_folder,
                 transform=ContrastiveLearningViewGeneratorWithParams(
+                    self.get_base_pipline_transform(224),
                     self.get_simclr_pipeline_transform(224),
                     n_views
                 )
@@ -64,6 +89,7 @@ class ContrastiveLearningDatasetWithParams:
                 self.root_folder,
                 train=True,
                 transform=ContrastiveLearningViewGeneratorWithParams(
+                    self.get_base_pipline_transform(224),
                     self.get_simclr_pipeline_transform(224),
                     n_views
                 ),
@@ -74,6 +100,7 @@ class ContrastiveLearningDatasetWithParams:
                 self.root_folder,
                 split='unlabeled',
                 transform=ContrastiveLearningViewGeneratorWithParams(
+                    self.get_base_pipline_transform(),
                     self.get_simclr_pipeline_transform(96),
                     n_views
                 ),
@@ -102,7 +129,7 @@ def params_collate_fn(batch):
 
     # Transpose images_list and params_list to group by views
     images = list(zip(*images_list))   # Now images is a list of views, each containing batch_size images
-    params = list(zip(*params_list))   # Now params is a list of views, each containing batch_size params
+    params = list(zip(*params_list))   # 
 
     # Stack images for each view
     images = [torch.stack(imgs, dim=0) for imgs in images]  # List of tensors with shape [batch_size, C, H, W]
@@ -137,22 +164,13 @@ def transformation_params_to_tensor_batch(params_dict):
     batch_size = len(next(iter(params_dict.values())))  # Get batch size from any value in the dict
 
     # Initialize a dictionary to hold parameter lists for each key
-    param_values = {key: [0.0] * batch_size for key in param_keys}
+    param_values = {key: [0.0] * batch_size for key in params_dict}
 
-    # Handle 'crop' separately since it contains tuples
-    crop_list = params_dict.get('crop', [(0, 0, 0, 0)] * batch_size)
-    for i, crop in enumerate(crop_list):
-        crop_i, crop_j, crop_h, crop_w = crop
-        param_values['crop_i'][i] = float(crop_i)
-        param_values['crop_j'][i] = float(crop_j)
-        param_values['crop_h'][i] = float(crop_h)
-        param_values['crop_w'][i] = float(crop_w)
 
     # Process other parameters
-    for key in ['flipped', 'color_jitter_applied', 'brightness_factor',
-                'contrast_factor', 'saturation_factor', 'hue_factor',
-                'grayscale', 'sigma']:
-        value_list = params_dict.get(key, [0.0] * batch_size)
+    for key in params_dict.keys():
+        value_list = params_dict.get(key)
+
         for i, value in enumerate(value_list):
             if isinstance(value, bool):
                 value = float(value)
@@ -162,13 +180,11 @@ def transformation_params_to_tensor_batch(params_dict):
                 value = float(value)
             param_values[key][i] = value
 
-    # Now, collect all parameter lists in the order defined by param_keys
     param_matrix = []
     for i in range(batch_size):
-        params_row = [param_values[key][i] for key in param_keys]
+        params_row = [param_values[key][i] for key in params_dict.keys()]
         param_matrix.append(params_row)
 
-    # Convert the list of lists into a tensor
     param_tensor = torch.tensor(param_matrix, dtype=torch.float32)
     return param_tensor
 

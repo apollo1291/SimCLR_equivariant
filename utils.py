@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 import yaml
+from collections import defaultdict, deque
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
@@ -154,15 +155,78 @@ def transpose(x):
 def normalize(*xs):
     return [None if x is None else F.normalize(x, dim=-1) for x in xs]
 
-def contrast_loss(sims):
+def contrast_loss(
+    sims, 
+    loss_leak=0.05, 
+    temperature=1, 
+    alpha=1e-3
+):
+    """
+    Contrastive loss (NCE style) with:
+      - optional label smoothing (`loss_leak`)
+      - temperature scaling (`temperature`)
+      - an L2 penalty on logits to discourage extremely large sims values.
+    """
     b = sims.shape[0]
-    sims = sims - torch.eye(b, b, device=sims.device) #* self.loss_margin
+    
+    sims = sims / temperature
+
+    sims = sims - torch.eye(b, b, device=sims.device)
+
     sims_1 = sims
     sims_2 = sims.permute(1, 0)
 
-    label_mask = torch.eye(sims_1.shape[0], sims_1.shape[1], device=sims.device, dtype=sims.dtype)
+    if loss_leak > 0.0:
+        id_mask = torch.eye(b, b, device=sims.device, dtype=sims.dtype)
+        label_mask = id_mask * (1 - loss_leak)
+        label_mask += (1 - id_mask) * (loss_leak / (b - 1))
+        label_mask /= label_mask.sum(dim=1, keepdim=True)
+    else:
+        label_mask = torch.eye(b, b, device=sims.device, dtype=sims.dtype)
 
-    labels = torch.arange(0, sims.shape[0], device=sims.device)
-    
-    nce_loss = 1 / 2 * (-F.log_softmax(sims_1, dim=-1) * label_mask).sum(1).mean() + 1 / 2 * (-F.log_softmax(sims_2, dim=-1) * label_mask).sum(1).mean()
-    return nce_loss, sims_1, labels
+    labels = torch.arange(0, b, device=sims.device)
+
+    # Standard NCE loss
+    nce_loss = 0.5 * (
+        (-F.log_softmax(sims_1, dim=-1) * label_mask).sum(1).mean() +
+        (-F.log_softmax(sims_2, dim=-1) * label_mask).sum(1).mean()
+    )
+
+    # REGULARIZATION: penalize large logits in sims
+    reg_term = (sims ** 2).mean()
+    loss_with_reg = nce_loss + alpha * reg_term
+
+    return loss_with_reg, sims_1, labels
+
+
+
+class RollingAvg:
+
+    def __init__(self, length, nonzero=False):
+        self.length = length
+        self.nonzero = nonzero
+        self.metrics = defaultdict(lambda: deque(maxlen=self.length))
+
+    def add(self, name, metric):
+        if self.nonzero and metric == 0:
+            return
+        if isinstance(metric, torch.Tensor):
+            metric = metric.detach()
+
+        self.metrics[name].append(metric)
+
+    def get(self, name):
+        with torch.no_grad():
+            return torch.tensor(list(self.metrics[name])).mean()
+
+    def get_all(self):
+        return {k: self.get(k) for k in self.metrics.keys()}
+
+    def add_all(self, values):
+        for k, v in values.items():
+            self.add(k, v)
+
+    def logall(self, log_func):
+        for k in self.metrics.keys():
+            log_func(k, self.get(k))
+

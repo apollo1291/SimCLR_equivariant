@@ -15,15 +15,22 @@ class ContrastiveLearningViewGenerator(object):
 
 class ContrastiveLearningViewGeneratorWithParams:
     """Generate multiple views of the same image with transformation parameters."""
-    def __init__(self, base_transform, n_views=2):
+    def __init__(self, base_transform, param_transform, n_views=2):
         self.base_transform = base_transform
+        self.param_transform = param_transform
         self.n_views = n_views
 
     def __call__(self, x):
+
         imgs = []
         params_list = []
-        for _ in range(self.n_views):
-            img, params = self.base_transform(x)
+        for _ in range(self.n_views - 1): # x is the first view so generate n - 1 more  
+            img, params = self.param_transform(x)
+            x = self.base_transform(x)
+
+            print(params)
+            
+            imgs.append(x)
             imgs.append(img)
             params_list.append(params)
         return imgs, params_list
