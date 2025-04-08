@@ -28,7 +28,7 @@ class ContrastiveLearningViewGeneratorWithParams:
             img, params = self.param_transform(x)
             x = self.base_transform(x)
 
-            print(params)
+            #print(params)
             
             imgs.append(x)
             imgs.append(img)

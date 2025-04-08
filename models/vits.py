@@ -31,7 +31,7 @@ class ForwardOutput:
     predicted_rep1: torch.Tensor
     logits: torch.Tensor
     labels: torch.Tensor
-    features: torch.Tensor
+    #features: torch.Tensor
     
 class BaseKQConModel(pl.LightningModule):
     def __init__(self, model, mlp_dim=1024, args=None) -> None:
@@ -108,45 +108,34 @@ class BaseKQConModel(pl.LightningModule):
     def _forward(self, x1, x2, t1, t2=None, use_fourier=True):
 
         device = x1.device
-        torch.save(x1, "checkpoints/images1.pth")
         t1 = t1.to(device)
 
         CLSq1, CLSq2 = None, None
         if use_fourier:
 
-            z1, predicted_z2 = self.forward(x3d, shift, eq=True)
-            z2, predicted_z1 = self.forward(augmented_x3d, -shift, eq=True)
-            a = self.info_nce_loss(z1, predicted_z1)
-            b = self.info_nce_loss(predicted_z2, z2)
-            c = alpha * torch.linalg.vector_norm(z1 - z2)
-            loss = a + b - c
-            self.log("train_loss", loss)
+            # fea1 = self.fourier_encoder_fn(t1)
+            fea1  = t1
 
-            fea1 = self.fourier_encoder_fn(t1)
-
-            CLSq1 = self.projector(fea1)
+            CLSq1 = self.x1_to_x2_projector(fea1)
+            CLSq2 = self.x2_to_x1_projector(fea1)
 
 
         image_rep1, predicted_rep2 = self.model(x1, CLSq1)
         image_rep2, predicted_rep1 = self.model(x2, CLSq2)
-        torch.save(image_rep1, "checkpoints/rep1_model_outputs.pth")
-        torch.save(image_rep2, "checkpoints/rep2_model_outputs.pth")
         
-
-        """
-        Curently, only img_loss2 is valid because, predicted_rep1 is not well defined
-        as a result of the asymetrical fourier encoding parameters, CLSq2 is always None
-        """
         if use_fourier:
-            #img1_loss, img1_logits, img1_labels = self.loss_fn(image_rep1, predicted_rep1)
-            sims = torch.einsum("bc,dc->bd", image_rep2, predicted_rep2)
-            img2_loss, img2_logits, img2_labels = self.loss_fn(sims, loss_leak=self.args.loss_leak)
+            sims1 = torch.einsum("bc,dc->bd", image_rep1, predicted_rep1)
+            img1_loss, img1_logits, img1_labels = self.loss_fn(sims1, loss_leak=self.args.loss_leak)
+
+            # maybe use negative pairwise distance
+            sims2 = torch.einsum("bc,dc->bd", image_rep2, predicted_rep2)
+            img2_loss, img2_logits, img2_labels = self.loss_fn(sims2, loss_leak=self.args.loss_leak)
             
-            loss =  img2_loss # + img1_loss
-            logits = img2_logits
-            labels = img2_labels
+            loss =  img1_loss + img2_loss
+            logits = torch.cat((img1_logits, img2_logits), dim=0)
+            labels = torch.cat((img1_labels, img2_labels), dim=0)
+
         else:
-            #TODO: look into this, we want diagonal to be large positive off diagonal should all be small negative 
             
             sims = torch.einsum("bc,dc->bd", image_rep1,  image_rep2)
             loss, logits, labels = self.loss_fn(sims, loss_leak=self.args.loss_leak)
@@ -159,7 +148,7 @@ class BaseKQConModel(pl.LightningModule):
             predicted_rep1=predicted_rep1, 
             logits=logits, 
             labels=labels, 
-            features=sims
+            #features=sims1
         )
 
     def training_step(self, batch, batch_idx):
@@ -212,30 +201,30 @@ class BaseKQConModel(pl.LightningModule):
 
         
 
-        if torch.isnan(classification_loss) and not self.collapse_ck:
-            # Save the current state of the linear classifier using PL's save_checkpoint
-            self.checkpoint_dict["collapse_batch"] = {
-                'images': [images[0].cpu(), images[1].cpu()],
-                #'params': params,
-                #'class_ids': class_ids,
-                'features': forward_output.features.cpu(),
-                'epoch': self.current_epoch,
-                'batch_idx': batch_idx
-                }
+        # if torch.isnan(classification_loss) and not self.collapse_ck:
+        #     # Save the current state of the linear classifier using PL's save_checkpoint
+        #     self.checkpoint_dict["collapse_batch"] = {
+        #         'images': [images[0].cpu(), images[1].cpu()],
+        #         #'params': params,
+        #         #'class_ids': class_ids,
+        #         'features': forward_output.features.cpu(),
+        #         'epoch': self.current_epoch,
+        #         'batch_idx': batch_idx
+        #         }
             
-            torch.save(self.checkpoint_dict, f'checkpoints/{self.args.name}_batch_checkpoint_epoch_{self.current_epoch}_batch_{batch_idx}.pth')
+        #     torch.save(self.checkpoint_dict, f'checkpoints/{self.args.name}_batch_checkpoint_epoch_{self.current_epoch}_batch_{batch_idx}.pth')
                 
-            self.trainer.save_checkpoint(
-            f"checkpoints/{self.args.name}_model_checkpoint_epoch_{self.current_epoch}_batch_{batch_idx}.ckpt"
-        )
-            self.collapse_ck = True
+        #     self.trainer.save_checkpoint(
+        #     f"checkpoints/{self.args.name}_model_checkpoint_epoch_{self.current_epoch}_batch_{batch_idx}.ckpt"
+        # )
+        #     self.collapse_ck = True
 
         if batch_idx % 5 == 0:
             self.checkpoint_dict["batch_5"] = {
                 'images': [images[0].cpu(), images[1].cpu()],
                 #'params': [params[0].cpu(), params[1].cpu()],
                 #'class_ids': class_ids.cpu(),
-                'features': forward_output.features.cpu(),
+                #'features': forward_output.features.cpu(),
                 'epoch': self.current_epoch,
                 'batch_idx': batch_idx
             }
@@ -244,7 +233,7 @@ class BaseKQConModel(pl.LightningModule):
             'images': [images[0].cpu(), images[1].cpu()],
             #'params': [params[0].cpu(), params[1].cpu()],
             #'class_ids': class_ids.cpu(),
-            'features': forward_output.features.cpu(),
+            #'features': forward_output.features.cpu(),
             'epoch': self.current_epoch,
             'batch_idx': batch_idx
         }
@@ -364,8 +353,9 @@ class KQConModel(BaseKQConModel):
         return self.encoding_size
 
     def _build_projector_and_predictor_mlps(self, embed_dim, mlp_dim, num_layers=10, output_dim=1000):
-        input_dim = self.get_feature_encoding_size()
-        self.projector = self._build_mlp(num_layers, input_dim=input_dim, mlp_dim=mlp_dim, output_dim=embed_dim, last_bn=True)#.to(self.device)
+        input_dim = 7 #self.get_feature_encoding_size()
+        self.x1_to_x2_projector = self._build_mlp(num_layers, input_dim=input_dim, mlp_dim=mlp_dim, output_dim=embed_dim, last_bn=True)#.to(self.device)
+        self.x2_to_x1_projector = self._build_mlp(num_layers, input_dim=input_dim, mlp_dim=mlp_dim, output_dim=embed_dim, last_bn=True)
 
         #TODO: simplify to single layer, Use layer norm on channel dim
         self.linear_classifier = self._build_mlp(3, self.model.rep_size, 128, output_dim=NUM_CLASS, last_bn=False)#.to(self.device)

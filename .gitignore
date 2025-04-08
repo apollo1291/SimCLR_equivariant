@@ -3,3 +3,9 @@ eqcon
 data
 datasets
 __pycache__
+.vscode/
+3d-example/backup_saved_runs/
+checkpoints/
+lightning_logs/
+logs/
+runs/

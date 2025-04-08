@@ -50,7 +50,7 @@ parser.add_argument('--fp16-precision', action='store_true',
                     help='Use 16-bit precision GPU training.')
 parser.add_argument('--out_dim', default=128, type=int,
                     help='feature dimension (default: 128)')
-parser.add_argument('--log-every-n-steps', default=100, type=int,
+parser.add_argument('--log-every-n-steps', default=10, type=int,
                     help='Log every n steps')
 parser.add_argument('--temperature', default=0.07, type=float,
                     help='softmax temperature (default: 0.07)')
@@ -69,7 +69,8 @@ MODELS = {
 def main():
     args = parser.parse_args()
     assert args.n_views == 2, "Only two view training is supported. Please use --n-views 2."
-    pl.seed_everything(args.seed)
+    pl.seed_everything(0)
+    torch.set_float32_matmul_precision('medium')
 
     # Data preparation
     dataset = ContrastiveLearningDatasetWithParams(args.train_data)
